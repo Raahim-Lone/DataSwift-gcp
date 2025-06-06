@@ -1,0 +1,8 @@
+query,hint,latency_postgresql_seconds,error
+e12b.sql,no_hint,18.752088,
+e12b.sql,hint1,11.300222,
+e12b.sql,hint2,30.407421,
+e12b.sql,hint3,30.414810000000003,
+e12b.sql,hint4,8.605276,
+e12b.sql,hint5,15.590159,
+e12b.sql,hint6,11.255893,

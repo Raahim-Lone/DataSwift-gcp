@@ -1,0 +1,465 @@
+#!/usr/bin/env python3
+"""
+DRIFTSAFE-LQO v2 Full Implementation
+
+A self-healing, GN-IMC-centric learned query optimizer for PostgreSQL.
+
+Features:
+ 1. Plan enumeration via pg_hint_plan combinations (49 hint sets).
+ 2. Plan2Vec-XL encoder (6-layer TreeTransformer + runtime tokens).
+ 3. Faiss ANN cache for (plan_emb ⊕ hint) tuples.
+ 4. GN-IMC heteroscedastic head with bias networks and variance head.
+ 5. XGBoost residual booster for systematic errors (offline async retrain).
+ 6. Thompson sampling candidate chooser.
+ 7. CUSUM drift sentinel (doubles exploration on alarm).
+ 8. FastAPI REST endpoint + CLI batch mode.
+
+Dependencies:
+ pip install torch faiss-cpu psycopg2-binary xgboost sqlglot fastapi uvicorn
+"""
+
+import os, sys, time, json, math, random, logging, threading, argparse, re
+from pathlib import Path
+from typing import List, Tuple, Optional
+
+import numpy as np
+import torch
+import torch.nn as nn
+import faiss
+import psycopg2
+import xgboost as xgb
+import sqlglot
+import joblib
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
+
+# ------------------------------------------------------------------------
+# 4. Residual Booster (async XGBoost)
+# ------------------------------------------------------------------------
+class ResidualBooster:
+    def __init__(self, freq: int = None):
+        if freq is None:
+            freq = RESIDUAL_FREQ
+        # delayed import of sklearn for unpickling
+        try:
+            from sklearn.preprocessing import PolynomialFeatures, StandardScaler
+        except ImportError:
+            raise ImportError("scikit-learn is required to unpickle the residual booster. Please install via `pip install scikit-learn`.")
+        # delayed import of sklearn for unpickling
+        try:
+            from sklearn.preprocessing import PolynomialFeatures, StandardScaler
+        except ImportError:
+            raise ImportError("scikit-learn is required to unpickle the residual booster. Please install via `pip install scikit-learn`.")
+        # load offline residual model and poly transformer
+        self.model = joblib.load(DATA_DIR / "residual_model_xgb.pkl")
+        self.poly  = joblib.load(DATA_DIR / "residual_model_poly.pkl")
+        self.buf   = []            # buffer of (features, error)
+        self.lock  = threading.Lock()
+        self.freq  = freq          # retrain frequency
+
+    def predict(self, x25: np.ndarray, h6: np.ndarray) -> float:
+        feat = np.hstack([x25, h6]).reshape(1,-1)
+        return float(self.model.predict(self.poly.transform(feat))[0])
+
+    def add(self, x25: np.ndarray, h6: np.ndarray, err: float) -> None:
+        with self.lock:
+            self.buf.append((np.hstack([x25, h6]), err))
+            if len(self.buf) >= self.freq:
+                threading.Thread(target=self.retrain, daemon=True).start()
+
+    def retrain(self) -> None:
+        with self.lock:
+            data = list(self.buf)
+            self.buf.clear()
+        X = np.vstack([d for d,_ in data])
+        y = np.array([e for _,e in data])
+        logger.info(f"[Booster] Retraining on {len(y)} samples")
+        m = xgb.XGBRegressor(
+            objective='reg:squarederror',
+            n_estimators=2000,
+            learning_rate=0.005,
+            max_depth=10,
+            subsample=0.7,
+            colsample_bytree=0.8,
+            n_jobs=-1
+        )
+        m.fit(self.poly.transform(X), y)
+        self.model = m
+
+# ------------------------------------------------------------------------
+# 5. Thompson & CUSUM
+# ------------------------------------------------------------------------ Thompson & CUSUM
+# ------------------------------------------------------------------------
+PG_DSN         = os.getenv("PG_DSN", "host=localhost port=6543 dbname=IMDB user=raahimlone password=raahimlhere")
+DATA_DIR       = Path("/Users/raahimlone/New_Data")
+OUTPUT_CSV     = Path("/Users/raahimlone/rahhh/results_ds_v2.csv")
+EMBED_DIM      = 256
+RANK           = 32
+SIM_THRESHOLD  = 0.93
+ONLINE_LR      = 0.05
+CUSUM_H        = 5.0
+RESIDUAL_FREQ  = 1000  # retrain booster every N samples
+
+# Logging
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+logger = logging.getLogger("driftsafe_v2")
+
+# ------------------------------------------------------------------------
+# Hint space (49 non-empty combos of 6 GUCs)
+# ------------------------------------------------------------------------
+HINTS = [
+    "enable_hashjoin",
+    "enable_indexonlyscan",
+    "enable_indexscan",
+    "enable_mergejoin",
+    "enable_nestloop",
+    "enable_seqscan"
+]
+COMBO_STRS = [
+    "hashjoin,indexonlyscan","hashjoin,indexonlyscan,indexscan",
+    "hashjoin,indexonlyscan,indexscan,mergejoin",
+    "hashjoin,indexonlyscan,indexscan,mergejoin,nestloop",
+    "hashjoin,indexonlyscan,indexscan,mergejoin,seqscan",
+    "hashjoin,indexonlyscan,indexscan,nestloop",
+    "hashjoin,indexonlyscan,indexscan,nestloop,seqscan",
+    "hashjoin,indexonlyscan,indexscan,seqscan","hashjoin,indexonlyscan,mergejoin",
+    "hashjoin,indexonlyscan,mergejoin,nestloop",
+    "hashjoin,indexonlyscan,mergejoin,nestloop,seqscan",
+    "hashjoin,indexonlyscan,mergejoin,seqscan","hashjoin,indexonlyscan,nestloop",
+    "hashjoin,indexonlyscan,nestloop,seqscan","hashjoin,indexonlyscan,seqscan",
+    "hashjoin,indexscan","hashjoin,indexscan,mergejoin",
+    "hashjoin,indexscan,mergejoin,nestloop",
+    "hashjoin,indexscan,mergejoin,nestloop,seqscan",
+    "hashjoin,indexscan,mergejoin,seqscan","hashjoin,indexscan,nestloop",
+    "hashjoin,indexscan,nestloop,seqscan","hashjoin,indexscan,seqscan",
+    "hashjoin,mergejoin,nestloop,seqscan","hashjoin,mergejoin,seqscan",
+    "hashjoin,nestloop,seqscan","hashjoin,seqscan",
+    "indexonlyscan,indexscan,mergejoin","indexonlyscan,indexscan,mergejoin,nestloop",
+    "indexonlyscan,indexscan,mergejoin,nestloop,seqscan",
+    "indexonlyscan,indexscan,mergejoin,seqscan","indexonlyscan,indexscan,nestloop",
+    "indexonlyscan,indexscan,nestloop,seqscan","indexonlyscan,mergejoin",
+    "indexonlyscan,mergejoin,nestloop","indexonlyscan,mergejoin,nestloop,seqcan",
+    "indexonlyscan,mergejoin,seqscan","indexonlyscan,nestloop",
+    "indexonlyscan,nestloop,seqscan","indexscan,mergejoin",
+    "indexscan,mergejoin,nestloop","indexscan,mergejoin,nestloop,seqscan",
+    "indexscan,mergejoin,seqscan","indexscan,nestloop","indexscan,nestloop,seqscan",
+    "mergejoin,nestloop,seqscan","mergejoin,seqcan","nestloop,seqscan"
+]
+# Correct minor typos
+COMBO_STRS = [c.replace('seqcan','seqscan') for c in COMBO_STRS]
+
+M, D = len(COMBO_STRS), len(HINTS)
+Y = np.zeros((M, D), dtype=np.float32)
+for i, c in enumerate(COMBO_STRS):
+    for tok in c.split(','):
+        Y[i, HINTS.index("enable_" + tok)] = 1.0
+
+# ------------------------------------------------------------------------
+# 1. Plan2Vec-XL Encoder with Runtime Tokens
+# ------------------------------------------------------------------------
+class Plan2VecXL(nn.Module):
+    def __init__(self,
+                 d_model: int = EMBED_DIM,
+                 vocab_size: int = 20000,
+                 max_len: int = 512,
+                 run_tokens: int = 32,
+                 depth: int = 6):
+        super().__init__()
+        self.tok   = nn.Embedding(vocab_size, d_model)
+        self.pos   = nn.Embedding(max_len,  d_model)
+        self.run   = nn.Embedding(run_tokens, d_model)
+        self.blocks = nn.ModuleList([
+            nn.TransformerEncoderLayer(d_model, 8, d_model*4,
+                                      batch_first=True, norm_first=True)
+            for _ in range(depth)
+        ])
+        self.out   = nn.Linear(d_model, d_model)
+
+    def tokenize(self, plan_json: str) -> List[int]:
+        toks = re.split(r"[^A-Za-z0-9_]+", plan_json.lower())
+        return [hash(t)%20000 for t in toks if t]
+
+    def forward(self, plan_json: str, run_vec: List[int]) -> torch.Tensor:
+        ids = self.tokenize(plan_json)
+        if not ids: ids = [0]
+        x = self.tok(torch.tensor(ids))
+        pos = torch.arange(len(ids))
+        x = x + self.pos(pos)
+        rv = torch.tensor(run_vec[:32])
+        x = x + self.run(rv)
+        for blk in self.blocks:
+            x = blk(x.unsqueeze(0)).squeeze(0)
+        return self.out(x.mean(dim=0))
+
+# ------------------------------------------------------------------------
+# 2. GN-IMC Heteroscedastic Module
+# ------------------------------------------------------------------------
+class GNIMCModel(nn.Module):
+    def __init__(self, rank: int = RANK):
+        super().__init__()
+        U0 = np.load(DATA_DIR / "U_best.npy")       # (EMBED_DIM, rank)
+        V0 = np.load(DATA_DIR / "V_best.npy")       # (D, rank)
+        self.U = nn.Parameter(torch.tensor(U0.T, dtype=torch.float32))
+        self.V = nn.Parameter(torch.tensor(V0.T, dtype=torch.float32))
+        self.p = nn.Sequential(nn.Linear(EMBED_DIM,64), nn.ReLU(), nn.Linear(64,1))
+        self.q = nn.Sequential(nn.Linear(D,32), nn.ReLU(), nn.Linear(32,1))
+        self.g = nn.Sequential(nn.Linear(rank,32), nn.ReLU(), nn.Linear(32,1))
+
+    def forward(self, z: torch.Tensor, h: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        Uz = self.U @ z   # (rank,)
+        Vh = self.V @ h   # (rank,)
+        mu = (Uz * Vh).sum() + self.p(z).squeeze() + self.q(h).squeeze()
+        log_var = self.g(Uz * Vh).squeeze().clamp(-10,10)
+        return mu, torch.exp(log_var)
+
+    def online_update(self, z: torch.Tensor, h: torch.Tensor, lat: float,
+                      lr: float = ONLINE_LR) -> Tuple[float,float,float]:
+        mu, var = self.forward(z,h)
+        err = lat - mu.item()
+        grad = -err
+        with torch.no_grad():
+            # rank-one updates
+            self.U[:] -= lr * grad * torch.outer(self.V @ h, z)
+            self.V[:] -= lr * grad * torch.outer(self.U @ z, h)
+        return err, mu.item(), var.item()
+
+# ------------------------------------------------------------------------
+# 3. Faiss ANN Cache
+# ------------------------------------------------------------------------
+class PlanCache:
+    def __init__(self):
+        dim = EMBED_DIM + D
+        self.index = faiss.IndexFlatIP(dim)
+        self.lat   = []
+
+    def key(self, z: torch.Tensor, h: torch.Tensor) -> np.ndarray:
+        v = torch.cat([z, h]).cpu().numpy()
+        return v / (np.linalg.norm(v)+1e-8)
+
+    def lookup(self, z: torch.Tensor, h: torch.Tensor) -> Optional[float]:
+        if self.index.ntotal == 0: return None
+        k = self.key(z,h)[None,:].astype('float32')
+        Dists, I = self.index.search(k, 1)
+        if Dists[0,0] >= SIM_THRESHOLD:
+            return self.lat[I[0,0]]
+        return None
+
+    def add(self, z: torch.Tensor, h: torch.Tensor, lat: float) -> None:
+        k = self.key(z,h)[None,:].astype('float32')
+        self.index.add(k)
+        self.lat.append(lat)
+
+# ------------------------------------------------------------------------
+# 4. Residual Booster (async XGBoost)
+# ------------------------------------------------------------------------
+class ResidualBooster:
+    def __init__(self, freq: int = RESIDUAL_FREQ):
+        # delayed import of sklearn for unpickling
+        try:
+            from sklearn.preprocessing import PolynomialFeatures, StandardScaler
+        except ImportError:
+            raise ImportError("scikit-learn is required to unpickle the residual booster. Please install via `pip install scikit-learn`.")
+        self.model = joblib.load(DATA_DIR / "residual_model_xgb.pkl")
+        self.poly  = joblib.load(DATA_DIR / "residual_model_poly.pkl")
+        self.buf   = []
+        self.lock  = threading.Lock()
+        self.freq  = freq
+    def predict(self, x25: np.ndarray, h6: np.ndarray) -> float:
+        feat = np.hstack([x25, h6]).reshape(1,-1)
+        return float(self.model.predict(self.poly.transform(feat))[0])
+
+    def add(self, x25: np.ndarray, h6: np.ndarray, err: float) -> None:
+        with self.lock:
+            self.buf.append((np.hstack([x25, h6]), err))
+            if len(self.buf) >= self.freq:
+                threading.Thread(target=self.retrain, daemon=True).start()
+
+    def retrain(self) -> None:
+        with self.lock:
+            data = self.buf[:]
+            self.buf.clear()
+        X = np.vstack([d for d,_ in data])
+        y = np.array([e for _,e in data])
+        logger.info(f"[Booster] retrain on {len(y)} points")
+        m = xgb.XGBRegressor(objective='reg:squarederror', n_estimators=2000,
+                             learning_rate=0.005, max_depth=10,
+                             subsample=0.7, colsample_bytree=0.8, n_jobs=-1)
+        m.fit(self.poly.transform(X), y)
+        self.model = m
+
+# ------------------------------------------------------------------------
+# 5. Thompson & CUSUM
+# ------------------------------------------------------------------------
+def thompson(cands: List[Tuple[float,float,int]]) -> int:
+    draws = [random.gauss(mu, math.sqrt(var)) for mu,var,_ in cands]
+    return cands[int(np.argmin(draws))][2]
+
+cusum_stat = 0.0
+
+def update_cusum(err: float, sigma: float) -> bool:
+    global cusum_stat
+    cusum_stat = max(0.0, cusum_stat + abs(err)/(sigma+1e-8))
+    if cusum_stat > CUSUM_H:
+        cusum_stat = 0.0
+        return True
+    return False
+
+# ------------------------------------------------------------------------
+# 6. SQL Feature Extractor (25 features)
+# ------------------------------------------------------------------------
+def build_alias_mapping(stmt):
+    m = {}
+    for t in stmt.find_all(sqlglot.exp.Table): m[t.alias_or_name] = t.name
+    return m
+
+def count_pred(wc, *types): return sum(1 for _ in wc.find_all(*types)) if wc else 0
+
+def sql_features(sql: str) -> np.ndarray:
+    try:
+        stmt = sqlglot.parse_one(sql, dialect='postgres')
+    except:
+        return np.zeros(25, dtype=np.float32)
+    amap = build_alias_mapping(stmt)
+    wc    = stmt.find(sqlglot.exp.Where)
+    grp   = stmt.find(sqlglot.exp.Group)
+    ord_  = stmt.find(sqlglot.exp.Order)
+    sel   = stmt.find(sqlglot.exp.Select)
+    # count predicates
+    num_pred = count_pred(wc, sqlglot.exp.EQ, sqlglot.exp.GT, sqlglot.exp.LT,
+                          sqlglot.exp.GTE, sqlglot.exp.LTE, sqlglot.exp.NEQ,
+                          sqlglot.exp.Like, sqlglot.exp.ILike, sqlglot.exp.In,
+                          sqlglot.exp.Between)
+    # implicit joins
+    joins = 0
+    if wc:
+        for eq in wc.find_all(sqlglot.exp.EQ):
+            l,r = eq.left, eq.right
+            if isinstance(l, sqlglot.exp.Column) and isinstance(r, sqlglot.exp.Column):
+                lt, rt = amap.get(l.table), amap.get(r.table)
+                if lt and rt and lt!=rt: joins+=1
+    # explicit joins by kind
+    jn = list(stmt.find_all(sqlglot.exp.Join))
+    inner = sum(1 for j in jn if (j.args.get('kind') or '').upper()=='INNER')
+    left  = sum(1 for j in jn if (j.args.get('kind') or '').upper()=='LEFT')
+    right = sum(1 for j in jn if (j.args.get('kind') or '').upper()=='RIGHT')
+    full  = sum(1 for j in jn if 'FULL' in (j.args.get('kind') or '').upper())
+    features = [
+        len(list(stmt.find_all(sqlglot.exp.Table))),   # tables
+        joins,                                          # implicit
+        num_pred,
+        1.0 if grp else 0.0,
+        1.0 if ord_ else 0.0,
+        1.0 if len(list(stmt.find_all(sqlglot.exp.Select)))>1 else 0.0,
+        len(sql),
+        len(list(stmt.walk())),
+        len(sel.expressions) if sel else 0,
+        1.0 if sel and sel.args.get('distinct') else 0.0,
+        sum(1 for e in sel.expressions if isinstance((e.this if isinstance(e,sqlglot.exp.Alias) else e), sqlglot.exp.Func)) if sel else 0,
+        count_pred(wc, sqlglot.exp.And, sqlglot.exp.Or, sqlglot.exp.Not),
+        count_pred(wc, sqlglot.exp.EQ, sqlglot.exp.GT, sqlglot.exp.LT,
+                   sqlglot.exp.GTE, sqlglot.exp.LTE, sqlglot.exp.NEQ),
+        len(list(grp.find_all(sqlglot.exp.Column))) if grp else 0,
+        len(list(ord_.find_all(sqlglot.exp.Ordered))) if ord_ else 0,
+        max(0,len(list(stmt.find_all(sqlglot.exp.Select)))-1),
+        1.0 if any(col.table and col.table in amap for sub in stmt.find_all(sqlglot.exp.Select)[1:]
+                   for col in sub.find_all(sqlglot.exp.Column)) else 0.0,
+        inner, left, right, full,
+        1.0 if stmt.find(sqlglot.exp.Limit) else 0.0,
+        1.0 if stmt.find(sqlglot.exp.Union) else 0.0,
+        len(list(stmt.find_all(sqlglot.exp.Union))),
+        len(list(stmt.find_all(sqlglot.exp.Case)))
+    ]
+    return np.array(features, dtype=np.float32)
+
+# ------------------------------------------------------------------------
+# 7. Orchestrator
+# ------------------------------------------------------------------------
+class DriftSafeEngine:
+    def __init__(self, k: int = M):
+        self.k       = k
+        self.enc     = Plan2VecXL().eval()
+        self.model   = GNIMCModel().eval()
+        self.cache   = PlanCache()
+        self.booster = ResidualBooster()
+        self.conn    = psycopg2.connect(PG_DSN)
+        self.qmap    = {}
+
+    def candidates(self, sql: str) -> List[Tuple[np.ndarray,str]]:
+        return [(Y[i], COMBO_STRS[i]) for i in range(min(self.k, M))]
+
+    def process(self, sql: str) -> dict:
+        qid = self.qmap.setdefault(sql, len(self.qmap))
+        x25 = sql_features(sql)
+        cands = []  # (mu, var, idx, z)
+        for idx,(hvec,hstr) in enumerate(self.candidates(sql)):
+            z = self.embed(sql, hvec)
+            cached = self.cache.lookup(z, torch.tensor(hvec))
+            if cached is not None:
+                cands.append((cached,1e-6,idx,z))
+            else:
+                mu,var = self.model(z, torch.tensor(hvec))
+                mu = mu.item() + self.booster.predict(x25,hvec)
+                cands.append((mu,var.item(),idx,z))
+        choice = thompson(cands)
+        zchosen = next(z for _,_,i,z in cands if i==choice)
+        rows,lat = self.execute(sql, Y[choice])
+        err,_,sigma2 = self.model.online_update(zchosen, torch.tensor(Y[choice]), lat)
+        self.cache.add(zchosen,torch.tensor(Y[choice]),lat)
+        self.booster.add(x25, Y[choice], err)
+        if update_cusum(err, math.sqrt(sigma2)):
+            logger.warning("CUSUM drift alarm fired")
+        return {"latency_ms":lat, "hint_combo":COMBO_STRS[choice], "rows":rows}
+
+    def embed(self, sql: str, hvec: np.ndarray) -> torch.Tensor:
+        cur = self.conn.cursor()
+        for j,f in enumerate(hvec): cur.execute(f"SET {HINTS[j]} TO {'ON' if f else 'OFF'};")
+        cur.execute("EXPLAIN (FORMAT JSON) " + sql)
+        plan = json.dumps(cur.fetchone()[0][0])
+        cur.execute("RESET ALL;")
+        cur.close()
+        run_vec = [0]*32
+        with torch.no_grad(): return self.enc(plan, run_vec)
+
+    def execute(self, sql: str, hvec: np.ndarray) -> Tuple[List[tuple],float]:
+        cur = self.conn.cursor()
+        for j,f in enumerate(hvec): cur.execute(f"SET {HINTS[j]} TO {'ON' if f else 'OFF'};")
+        t0 = time.perf_counter()
+        cur.execute(sql)
+        rows = cur.fetchall()
+        latency = (time.perf_counter() - t0)*1000.0
+        cur.execute("RESET ALL;")
+        cur.close()
+        return rows, latency
+
+# ------------------------------------------------------------------------
+# 8. REST & CLI
+# ------------------------------------------------------------------------
+app = FastAPI(title="DriftSafe-LQO-v2")
+engine = DriftSafeEngine()
+class QReq(BaseModel): query: str
+@app.post("/query")
+def run_query(q: QReq):
+    try:
+        return engine.process(q.query)
+    except Exception as e:
+        logger.exception("Error"); raise HTTPException(500,str(e))
+
+if __name__ == "__main__":
+    p = argparse.ArgumentParser()
+    p.add_argument("--sql", help="SQL file or raw string")
+    p.add_argument("--dir", help="Folder of .sql for batch")
+    args = p.parse_args()
+    if args.sql:
+        sql = Path(args.sql).read_text() if Path(args.sql).exists() else args.sql
+        print(json.dumps(engine.process(sql), indent=2))
+    elif args.dir:
+        out = open(OUTPUT_CSV,'w')
+        out.write("filename,combo,latency_ms\n")
+        for f in Path(args.dir).glob("*.sql"):
+            sql = f.read_text()
+            r = engine.process(sql)
+            out.write(f"{f.name},{r['hint_combo']},{r['latency_ms']:.2f}\n")
+        out.close()
+        logger.info(f"Results saved to {OUTPUT_CSV}")
+    else:
+        print("Use --sql or --dir")

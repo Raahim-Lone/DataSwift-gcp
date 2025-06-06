@@ -1,0 +1,4 @@
+variant,num_queries,mean_speedup,p99_speedup,regressions_gt20pct,worst_regression
+default,1,1.1910,1.1910,0,1.1910
+gnimc,1,1.1232,1.1232,0,1.1232
+full,1,2.0147,2.0147,1,2.0147

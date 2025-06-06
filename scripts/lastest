@@ -1,0 +1,487 @@
+#!/usr/bin/env python3
+"""
+Full Inference Script Using 25 Features with Integrated Min-Max Scaling (0 to 4)
+for Inductive Matrix Completion Model with Residual Correction.
+
+This script:
+  1. Loads the IMC model factors (U_best and V_best),
+  2. Loads the residual model, polynomial transformer, and uses a MinMaxScaler for query features,
+  3. Extracts 25 features from each SQL query,
+  4. Predicts the cost for each hint combination,
+  5. Selects the best hint combination,
+  6. Executes the query (via PostgreSQL's EXPLAIN ANALYZE) with the selected hints,
+  7. Saves the results to a CSV file.
+"""
+
+import os
+import sys
+import logging
+import psycopg2
+import numpy as np
+import pandas as pd
+import re
+import sqlglot
+from sqlglot import exp
+from sklearn.preprocessing import MinMaxScaler
+import joblib
+
+# ---------------- Environment Configuration ----------------
+def configure_environment():
+    project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+    scripts_path = os.path.join(project_root, "scripts")
+    if scripts_path in sys.path:
+        sys.path.remove(scripts_path)
+    if project_root not in sys.path:
+        sys.path.insert(0, project_root)
+
+configure_environment()
+
+# ---------------- Logging Configuration ----------------
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[logging.StreamHandler()]
+)
+logger = logging.getLogger(__name__)
+
+# ---------------- Define Hints and Combination Strings ----------------
+HINTS = [
+    "enable_hashjoin",
+    "enable_indexonlyscan",
+    "enable_indexscan",
+    "enable_mergejoin",
+    "enable_nestloop",
+    "enable_seqscan"
+]
+
+COMBO_STRS = [
+    "hashjoin,indexonlyscan",
+    "hashjoin,indexonlyscan,indexscan",
+    "hashjoin,indexonlyscan,indexscan,mergejoin",
+    "hashjoin,indexonlyscan,indexscan,mergejoin,nestloop",
+    "hashjoin,indexonlyscan,indexscan,mergejoin,seqscan",
+    "hashjoin,indexonlyscan,indexscan,nestloop",
+    "hashjoin,indexonlyscan,indexscan,nestloop,seqscan",
+    "hashjoin,indexonlyscan,indexscan,seqscan",
+    "hashjoin,indexonlyscan,mergejoin",
+    "hashjoin,indexonlyscan,mergejoin,nestloop",
+    "hashjoin,indexonlyscan,mergejoin,nestloop,seqscan",
+    "hashjoin,indexonlyscan,mergejoin,seqscan",
+    "hashjoin,indexonlyscan,nestloop",
+    "hashjoin,indexonlyscan,nestloop,seqscan",
+    "hashjoin,indexonlyscan,seqscan",
+    "hashjoin,indexscan",
+    "hashjoin,indexscan,mergejoin",
+    "hashjoin,indexscan,mergejoin,nestloop",
+    "hashjoin,indexscan,mergejoin,nestloop,seqscan",
+    "hashjoin,indexscan,mergejoin,seqscan",
+    "hashjoin,indexscan,nestloop",
+    "hashjoin,indexscan,nestloop,seqscan",
+    "hashjoin,indexscan,seqscan",
+    "hashjoin,mergejoin,nestloop,seqscan",
+    "hashjoin,mergejoin,seqscan",
+    "hashjoin,nestloop,seqscan",
+    "hashjoin,seqscan",
+    "indexonlyscan,indexscan,mergejoin",
+    "indexonlyscan,indexscan,mergejoin,nestloop",
+    "indexonlyscan,indexscan,mergejoin,nestloop,seqscan",
+    "indexonlyscan,indexscan,mergejoin,seqscan",
+    "indexonlyscan,indexscan,nestloop",
+    "indexonlyscan,indexscan,nestloop,seqscan",
+    "indexonlyscan,mergejoin",
+    "indexonlyscan,mergejoin,nestloop",
+    "indexonlyscan,mergejoin,nestloop,seqscan",
+    "indexonlyscan,mergejoin,seqscan",
+    "indexonlyscan,nestloop",
+    "indexonlyscan,nestloop,seqscan",
+    "indexscan,mergejoin",
+    "indexscan,mergejoin,nestloop",
+    "indexscan,mergejoin,nestloop,seqscan",
+    "indexscan,mergejoin,seqscan",
+    "indexscan,nestloop",
+    "indexscan,nestloop,seqscan",
+    "mergejoin,nestloop,seqscan",
+    "mergejoin,seqscan",
+    "nestloop,seqscan"
+]
+
+def build_hint_matrix(combo_strs, hint_list):
+    N = len(combo_strs)
+    D = len(hint_list)
+    Y = np.zeros((N, D), dtype=float)
+    for i, c_str in enumerate(combo_strs):
+        items = [item.strip() for item in c_str.split(",") if item.strip()]
+        for item in items:
+            enable_str = "enable_" + item
+            if enable_str in hint_list:
+                j = hint_list.index(enable_str)
+                Y[i, j] = 1.0
+    return Y
+
+# ---------------- SQL Feature Extraction Functions (25 features) ----------------
+def build_alias_mapping(stmt):
+    alias_mapping = {}
+    for table in stmt.find_all(exp.Table):
+        alias = table.alias_or_name
+        name = table.name
+        alias_mapping[alias] = name
+    return alias_mapping
+
+def count_predicates(where_clause):
+    if where_clause is None:
+        return 0
+    predicate_types = (exp.EQ, exp.GT, exp.LT, exp.GTE, exp.LTE, exp.NEQ, exp.Like, exp.ILike, exp.In, exp.Between)
+    predicates = list(where_clause.find_all(*predicate_types))
+    return len(predicates)
+
+def count_joins(where_clause, alias_mapping):
+    if where_clause is None:
+        return 0
+    join_pairs = set()
+    for predicate in where_clause.find_all(exp.EQ):
+        left = predicate.left
+        right = predicate.right
+        if isinstance(left, exp.Column) and isinstance(right, exp.Column):
+            left_table = alias_mapping.get(left.table)
+            right_table = alias_mapping.get(right.table)
+            if left_table and right_table and left_table != right_table:
+                pair = tuple(sorted([left_table, right_table]))
+                join_pairs.add(pair)
+    return len(join_pairs)
+
+def count_aggregate_functions(select_expressions):
+    aggregate_functions = {'SUM', 'COUNT', 'AVG', 'MIN', 'MAX', 'MEDIAN', 'MODE'}
+    count = 0
+    for expr in select_expressions:
+        if isinstance(expr, exp.Alias):
+            expr = expr.this
+        if isinstance(expr, exp.Func) and expr.name.upper() in aggregate_functions:
+            count += 1
+    return count
+
+def count_logical_operators(where_clause):
+    if where_clause is None:
+        return 0
+    logical_ops = (exp.And, exp.Or, exp.Not)
+    return sum(1 for _ in where_clause.find_all(*logical_ops))
+
+def count_comparison_operators(where_clause):
+    if where_clause is None:
+        return 0
+    comparison_ops = (exp.EQ, exp.GT, exp.LT, exp.GTE, exp.LTE, exp.NEQ)
+    return sum(1 for _ in where_clause.find_all(*comparison_ops))
+
+def count_group_by_columns(stmt):
+    group = stmt.find(exp.Group)
+    if group:
+        return len(list(group.find_all(exp.Column)))
+    return 0
+
+def count_order_by_columns(stmt):
+    order = stmt.find(exp.Order)
+    if order:
+        return len(list(order.find_all(exp.Ordered)))
+    return 0
+
+def count_nested_subqueries(stmt):
+    subqueries = list(stmt.find_all(exp.Select))
+    return max(0, len(subqueries) - 1)
+
+def count_correlated_subqueries(stmt):
+    correlated = False
+    for subquery in stmt.find_all(exp.Select):
+        if subquery is stmt:
+            continue
+        outer_tables = {t.alias_or_name for t in stmt.find_all(exp.Table)}
+        for col in subquery.find_all(exp.Column):
+            if col.table and col.table in outer_tables:
+                correlated = True
+                break
+        if correlated:
+            break
+    return 1.0 if correlated else 0.0
+
+def count_case_statements(stmt):
+    return len(list(stmt.find_all(exp.Case)))
+
+def count_union_operations(stmt):
+    return len(list(stmt.find_all(exp.Union)))
+
+def parse_sql(query_str):
+    try:
+        statements = sqlglot.parse(query_str, dialect='postgres')
+        if not statements:
+            raise ValueError("No statements parsed.")
+        stmt = statements[0]
+        alias_mapping = build_alias_mapping(stmt)
+        tables = [t.alias_or_name for t in stmt.find_all(exp.Table)]
+        num_tables = len(tables)
+        where_clause = stmt.find(exp.Where)
+        num_predicates = count_predicates(where_clause)
+        num_joins = count_joins(where_clause, alias_mapping)
+        has_group_by = 1.0 if stmt.find(exp.Group) else 0.0
+        has_order_by = 1.0 if stmt.find(exp.Order) else 0.0
+        num_nested_subqueries = count_nested_subqueries(stmt)
+        has_subquery = 1.0 if num_nested_subqueries > 0 else 0.0
+        query_length = len(query_str)
+        num_tokens = len(list(stmt.walk()))
+        select = stmt.find(exp.Select)
+        select_expressions = select.expressions if select else []
+        num_select_expressions = len(select_expressions)
+        has_distinct = 1.0 if select and select.args.get("distinct") else 0.0
+        num_aggregate_functions = count_aggregate_functions(select_expressions)
+        num_logical_operators = count_logical_operators(where_clause)
+        num_comparison_operators = count_comparison_operators(where_clause)
+        num_group_by_columns = count_group_by_columns(stmt)
+        num_order_by_columns = count_order_by_columns(stmt)
+        has_correlated_subqueries = count_correlated_subqueries(stmt)
+        num_inner_joins = len([j for j in stmt.find_all(exp.Join) if j.args.get('kind') and j.args.get('kind').upper()=='INNER'])
+        num_left_joins = len([j for j in stmt.find_all(exp.Join) if j.args.get('kind') and j.args.get('kind').upper()=='LEFT'])
+        num_right_joins = len([j for j in stmt.find_all(exp.Join) if j.args.get('kind') and j.args.get('kind').upper()=='RIGHT'])
+        num_full_outer_joins = len([j for j in stmt.find_all(exp.Join) if j.args.get('kind') and j.args.get('kind').upper() in ['FULL OUTER','FULLOUTER','FULL_OUTER']])
+        has_limit = 1.0 if stmt.find(exp.Limit) else 0.0
+        has_union = 1.0 if stmt.find(exp.Union) else 0.0
+        num_union_operations = count_union_operations(stmt)
+        num_case_statements = count_case_statements(stmt)
+        features = {
+            "num_tables": num_tables,
+            "num_joins": num_joins,
+            "num_predicates": num_predicates,
+            "has_group_by": has_group_by,
+            "has_order_by": has_order_by,
+            "has_subquery": has_subquery,
+            "query_length": query_length,
+            "num_tokens": num_tokens,
+            "num_select_expressions": num_select_expressions,
+            "has_distinct": has_distinct,
+            "num_aggregate_functions": num_aggregate_functions,
+            "num_logical_operators": num_logical_operators,
+            "num_comparison_operators": num_comparison_operators,
+            "num_group_by_columns": num_group_by_columns,
+            "num_order_by_columns": num_order_by_columns,
+            "num_nested_subqueries": num_nested_subqueries,
+            "has_correlated_subqueries": has_correlated_subqueries,
+            "num_inner_joins": num_inner_joins,
+            "num_left_joins": num_left_joins,
+            "num_right_joins": num_right_joins,
+            "num_full_outer_joins": num_full_outer_joins,
+            "has_limit": has_limit,
+            "has_union": has_union,
+            "num_union_operations": num_union_operations,
+            "num_case_statements": num_case_statements
+        }
+        return features
+    except Exception as e:
+        logger.error(f"Error parsing SQL: {e}")
+        return {key: 0.0 for key in [
+            "num_tables", "num_joins", "num_predicates", "has_group_by", "has_order_by",
+            "has_subquery", "query_length", "num_tokens", "num_select_expressions", "has_distinct",
+            "num_aggregate_functions", "num_logical_operators", "num_comparison_operators",
+            "num_group_by_columns", "num_order_by_columns", "num_nested_subqueries",
+            "has_correlated_subqueries", "num_inner_joins", "num_left_joins", "num_right_joins",
+            "num_full_outer_joins", "has_limit", "has_union", "num_union_operations", "num_case_statements"
+        ]}
+
+def prepare_25_features(feats_dict):
+    feature_order = [
+        "num_tables",
+        "num_joins",
+        "num_predicates",
+        "has_group_by",
+        "has_order_by",
+        "has_subquery",
+        "query_length",
+        "num_tokens",
+        "num_select_expressions",
+        "has_distinct",
+        "num_aggregate_functions",
+        "num_logical_operators",
+        "num_comparison_operators",
+        "num_group_by_columns",
+        "num_order_by_columns",
+        "num_nested_subqueries",
+        "has_correlated_subqueries",
+        "num_inner_joins",
+        "num_left_joins",
+        "num_right_joins",
+        "num_full_outer_joins",
+        "has_limit",
+        "has_union",
+        "num_union_operations",
+        "num_case_statements"
+    ]
+    raw_features = [feats_dict.get(key, 0.0) for key in feature_order]
+    return np.array(raw_features, dtype=np.float32).reshape(1, -1)
+
+# ---------------- IMC Model Class ----------------
+class InductiveMatrixCompletionModel:
+    def __init__(self, U, V, residual_model, poly):
+        self.Z = U @ V.T   # Here, Z should map query features to a cost space
+        self.residual_model = residual_model
+        self.poly = poly
+
+    def predict_all_combos(self, x_feat, Y):
+        # x_feat: (N, 25)
+        # Initial cost: (N, D) = x_feat @ Z   (assume Z shape is (25,6) so that D = 6)
+        initial_cost = x_feat @ self.Z   # shape (N,6)
+        # For each query, compute cost for each hint combo:
+        # initial cost for combos: (N, M) = initial_cost @ Y.T
+        init_cost_combo = initial_cost @ Y.T
+        # Flatten to (N*M,)
+        init_cost_flat = init_cost_combo.flatten()
+        # Prepare residual prediction features: for each combo, concatenate query features and Y row.
+        N = x_feat.shape[0]
+        M = Y.shape[0]
+        x_feat_repeated = np.repeat(x_feat, M, axis=0)  # (N*M, 25)
+        Y_expanded = np.tile(Y, (N, 1))                  # (N*M, 6)
+        X_concat = np.hstack((x_feat_repeated, Y_expanded))  # (N*M, 31)
+        X_poly = self.poly.transform(X_concat)
+        residual_pred = self.residual_model.predict(X_poly)
+        residual_pred = residual_pred.reshape(N, M)
+        adjusted_cost = init_cost_combo + residual_pred
+        return adjusted_cost
+
+# ---------------- PostgreSQL Functions ----------------
+def apply_plan_hints(cursor, plan_vector):
+    for i, hint_name in enumerate(HINTS):
+        val = plan_vector[i]
+        cmd = f"SET {hint_name} TO {'ON' if val >= 0.5 else 'OFF'};"
+        cursor.execute(cmd)
+
+def reset_all_hints(cursor):
+    cursor.execute("RESET ALL;")
+
+def parse_explain_analyze_output(explain_output):
+    total_time = None
+    for row in explain_output:
+        line = row[0]
+        match = re.search(r"Execution Time:\s+([\d.]+)\s+ms", line)
+        if match:
+            total_time = float(match.group(1)) / 1000.0
+            break
+    if total_time is None:
+        logger.warning("Could not parse execution time.")
+        return float("inf")
+    return total_time
+
+def run_query_postgres_once_explain_analyze(query_str, plan_vector, pg_host, pg_db, pg_user, pg_password, port=5432):
+    conn = None
+    try:
+        conn = psycopg2.connect(host=pg_host, dbname=pg_db, user=pg_user, password=pg_password, port=port)
+        conn.autocommit = True
+        with conn.cursor() as cur:
+            apply_plan_hints(cur, plan_vector)
+            cur.execute(f"EXPLAIN ANALYZE {query_str}")
+            explain_output = cur.fetchall()
+            reset_all_hints(cur)
+            return parse_explain_analyze_output(explain_output)
+    except Exception as e:
+        logger.error(f"Error executing EXPLAIN ANALYZE: {e}")
+        return float("inf")
+    finally:
+        if conn:
+            conn.close()
+
+# ---------------- Main Inference Routine ----------------
+def main():
+    MODEL_DIR = "/Users/raahimlone/New_Data"
+    QUERIES_DIR = "/Users/raahimlone/rahhh/Data_Gathering/raw_sql_queries"
+    OUTPUT_CSV = "/Users/raahimlone/rahhh/results_imc_25feat.csv"
+    PG_HOST = "localhost"
+    PG_DB = "IMDB"
+    PG_USER = "postgres"
+    PG_PASSWORD = "raahimhere"
+    PG_PORT = 6543
+
+    # Load IMC model components
+    try:
+        U_best = np.load(os.path.join(MODEL_DIR, "U_best.npy"))
+        V_best = np.load(os.path.join(MODEL_DIR, "V_best.npy"))
+        logger.info(f"Loaded U_best and V_best: {U_best.shape}, {V_best.shape}")
+    except Exception as e:
+        logger.error(f"Error loading U_best/V_best: {e}")
+        return
+
+    # Load residual model and polynomial transformer
+    try:
+        residual_model = joblib.load(os.path.join(MODEL_DIR, "residual_model_xgb.pkl"))
+        poly = joblib.load(os.path.join(MODEL_DIR, "residual_model_poly.pkl"))
+        scaler = joblib.load(os.path.join(MODEL_DIR, "residual_model_scaler.pkl"))
+        logger.info("Loaded residual model, polynomial transformer, and scaler.")
+    except Exception as e:
+        logger.error(f"Error loading residual model components: {e}")
+        return
+
+    imc_model = InductiveMatrixCompletionModel(U_best, V_best, residual_model, poly)
+
+    Y = build_hint_matrix(COMBO_STRS, HINTS)
+    logger.info(f"Built hint matrix with shape: {Y.shape}")
+
+    # Feature extraction from queries
+    query_files = [f for f in os.listdir(QUERIES_DIR) if f.endswith(".sql")]
+    features_list = []
+    filenames = []
+    for fname in query_files:
+        full_path = os.path.join(QUERIES_DIR, fname)
+        try:
+            with open(full_path, 'r', encoding="utf-8") as f:
+                query_str = f.read().strip()
+            if not query_str:
+                logger.warning(f"{fname} is empty. Skipping.")
+                continue
+            feats = parse_sql(query_str)
+            feat_arr = prepare_25_features(feats)  # shape (1,25)
+            features_list.append(feat_arr)
+            filenames.append(fname)
+        except Exception as e:
+            logger.error(f"Error processing {fname}: {e}")
+
+    if not features_list:
+        logger.error("No queries processed. Exiting.")
+        return
+
+    X_features = np.vstack(features_list)  # (N,25)
+    # Apply the saved MinMaxScaler
+    X_scaled = scaler.transform(X_features)
+
+    # Predict costs for all hint combinations
+    cost_predictions = imc_model.predict_all_combos(X_scaled, Y)  # shape (N, M)
+    best_indices = np.argmin(cost_predictions, axis=1)  # (N,)
+    best_combos = [COMBO_STRS[idx] for idx in best_indices]
+    best_Y_vectors = Y[best_indices]  # shape (N,6)
+
+    results = []
+    for i, fname in enumerate(filenames):
+        full_path = os.path.join(QUERIES_DIR, fname)
+        try:
+            with open(full_path, 'r', encoding="utf-8") as f:
+                query_str = f.read().strip()
+            if not query_str:
+                logger.warning(f"{fname} is empty. Skipping.")
+                continue
+            best_hint_vector = best_Y_vectors[i]
+            latency = run_query_postgres_once_explain_analyze(query_str, best_hint_vector,
+                                                              PG_HOST, PG_DB, PG_USER, PG_PASSWORD, PG_PORT)
+            enabled_hints = [HINTS[j].replace("enable_", "") for j in range(len(HINTS)) if best_hint_vector[j] >= 0.5]
+            predicted_cost = cost_predictions[i, best_indices[i]]
+            results.append({
+                "filename": fname,
+                "best_idx": int(best_indices[i]),
+                "best_combo": best_combos[i],
+                "predicted_cost": predicted_cost,
+                "latency": latency,
+                "hints": ",".join(enabled_hints)
+            })
+            logger.info(f"{fname}: Hints {enabled_hints}, Predicted Cost {predicted_cost:.4f}, Latency {latency:.4f}s")
+        except Exception as e:
+            logger.error(f"Error executing query {fname}: {e}")
+
+    if results:
+        df_results = pd.DataFrame(results)
+        df_results.to_csv(OUTPUT_CSV, index=False)
+        logger.info(f"Results saved to {OUTPUT_CSV}")
+    else:
+        logger.warning("No results produced.")
+
+if __name__ == "__main__":
+    main()

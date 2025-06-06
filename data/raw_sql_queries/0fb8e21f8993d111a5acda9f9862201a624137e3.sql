@@ -28,4 +28,4 @@ AND (it.id IN ('6'))
 AND (mi1.info ILIKE '%m%')
 AND (cn.name ILIKE '%co%')
 GROUP BY n.gender, rt.role, cn.name
-ORDER BY COUNT(*) DESC
+ORDER BY COUNT(*) DESC;

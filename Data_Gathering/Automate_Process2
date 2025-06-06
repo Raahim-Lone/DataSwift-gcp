@@ -11,12 +11,12 @@ DB_CONFIG = {
     'user': 'postgres',       # Replace with your PostgreSQL username
     'password': 'raahimlhere',   # Replace with your PostgreSQL password
     'host': 'localhost',           # Replace if your DB is hosted elsewhere
-    'port': '5432',                # Default PostgreSQL port
+    'port': '6543',                # Default PostgreSQL port
 }
 
-QUERIES_DIR = '/Users/raahimlone/imdb_pg_dataset-1/job'
+QUERIES_DIR = '/Users/raahimlone/imdb_pg_dataset-1'
 HINTS_FILE = '/Users/raahimlone/project_root/hints.json'
-OUTPUT_CSV = '/Users/raahimlone/rahhh/Data_Gathering/query_latency_test.csv'
+OUTPUT_CSV = '/Users/raahimlone/rahhh/Data_Gathering/query_latency_testrah.csv'
 
 def load_queries(directory):
     queries = {}

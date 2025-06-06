@@ -1,0 +1,85 @@
+#!/usr/bin/env python3
+"""
+quick_encoder_probe.py
+
+Load 128 graphs through the saved Plan2VecEncoder and print diagnostics
+to see exactly why z is constant.
+"""
+
+import os
+import sys
+import json
+import torch
+import numpy as np
+from torch_geometric.data import Batch
+
+# ──────────────────────────────────────────────────────────────────────────────
+# adjust path so we can import your modules
+ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+if ROOT not in sys.path:
+    sys.path.insert(0, ROOT)
+
+from modules.parse_plan       import parse_plan
+from modules.plan2vec import Plan2VecEncoder
+from modules.op_maps          import NODE_TYPE_MAP
+
+# ──────────────────────────────────────────────────────────────────────────────
+def find_first_json(dsb_root):
+    """Walk dsb_root and return the first *.json filepath."""
+    for root, _, files in os.walk(dsb_root):
+        for fn in files:
+            if fn.lower().endswith('.json'):
+                return os.path.join(root, fn)
+    raise RuntimeError(f"No JSON files found under {dsb_root!r}")
+
+# ──────────────────────────────────────────────────────────────────────────────
+def main():
+    # 1) Load your trained encoder
+    enc_ckpt = os.path.expanduser('~/models/plan2vec_ckpt.pt')
+    if not os.path.exists(enc_ckpt):
+        raise RuntimeError("No encoder checkpoint found. Run one training epoch first.")
+    # We need a dummy graph to infer dims
+    dsb_root = os.path.expanduser('~/Downloads/dsb')
+    sample_json = find_first_json(dsb_root)
+    data = json.load(open(sample_json, 'r'))
+    rec  = data[0] if isinstance(data, list) else data
+    g0   = parse_plan(rec)
+
+    encoder = Plan2VecEncoder(len(NODE_TYPE_MAP), g0.x.size(1) - 1)
+    encoder.load_state_dict(torch.load(enc_ckpt, map_location='cpu'))
+    encoder.eval()
+
+    # 2) Build a batch of 128 graphs
+    graphs = []
+    for root, _, files in os.walk(dsb_root):
+        for fn in files:
+            if not fn.lower().endswith('.json'):
+                continue
+            recs = json.load(open(os.path.join(root, fn), 'r'))
+            recs = recs if isinstance(recs, list) else [recs]
+            graphs.append(parse_plan(recs[0]))
+            if len(graphs) >= 128:
+                break
+        if len(graphs) >= 128:
+            break
+    batch = Batch.from_data_list(graphs)
+
+    # 3) Encode and print diagnostics
+    with torch.no_grad():
+        z = encoder(batch)
+
+    # 4) Flatten all op-IDs from the batch to inspect distribution
+    all_ids = np.concatenate([g.x[:, 0].numpy().astype(int) for g in graphs])
+    print("\n===== Encoder Probe =====")
+    print("NODE_TYPE_MAP size     :", len(NODE_TYPE_MAP))
+    print("op-ID  min..max        :", all_ids.min(), "..", all_ids.max())
+    print("unique op-IDs in batch :", np.unique(all_ids).size)
+    zn = z.norm(dim=1)
+    print("‖z‖  mean ± std       :",
+          f"{zn.mean().item():.3f} ± {zn.std().item():.3f}")
+    print("first z[0][:8]         :", z[0][:8].numpy().round(3))
+    print("first z[1][:8]         :", z[1][:8].numpy().round(3))
+    print("==========================\n")
+
+if __name__ == "__main__":
+    main()

@@ -1,8 +1,15 @@
 database:
+  # Old key (can be kept for legacy reasons)
+  query_path: "/Users/raahimlone/imdb_pg_dataset-1/job"
+  # New key to use for file lookups
+  base_query_path: "/Users/raahimlone/imdb_pg_dataset-1/ceb-imdb-3k"
+  dataset_file: "/Users/raahimlone/rahhh/output.csv"
+
   csv_file: "/Users/raahimlone/rahhh/Data_Gathering/masked.csv"  # Primary CSV
   csv_file2: "/Users/raahimlone/rahhh/Data_Gathering/query_latency_test.csv"
   query_path: "/Users/raahimlone/imdb_pg_dataset-1/job"
   hint_path: "/Users/raahimlone/rahhh/data/raw_hints"
+
 
   # Secondary CSV
 

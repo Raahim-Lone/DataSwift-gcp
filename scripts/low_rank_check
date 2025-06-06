@@ -1,0 +1,58 @@
+#!/usr/bin/env python3
+
+import numpy as np
+from fancyimpute import IterativeSVD
+
+def complete_matrix_rank_k(W, M, rank=6):
+    """
+    Use IterativeSVD from fancyimpute to complete a partially observed matrix W
+    with a strictly rank-k factorization.
+    
+    Parameters
+    ----------
+    W : numpy.ndarray
+        (n x m) data matrix with some missing entries
+    M : numpy.ndarray
+        (n x m) binary mask (1=observed, 0=missing)
+    rank : int
+        The exact rank for the SVD approximation
+    
+    Returns
+    -------
+    W_completed : numpy.ndarray
+        The completed matrix of the same shape as W
+    U, svals, Vt : np.ndarray
+        SVD factors of the completed matrix
+    """
+    # 1) Prepare a version of W with np.nan in unobserved spots
+    W_nan = np.copy(W).astype(float)
+    W_nan[M == 0] = np.nan
+
+    # 2) Run IterativeSVD with desired rank
+    isvd = IterativeSVD(rank=rank, verbose=True)  # You can also set 'convergence_threshold', etc.
+    W_completed = isvd.fit_transform(W_nan)
+
+    # 3) Do a standard SVD on the completed matrix to see the final singular values
+    U, svals, Vt = np.linalg.svd(W_completed, full_matrices=False)
+    return W_completed, U, svals, Vt
+
+
+if __name__ == "__main__":
+    # Example usage: change these paths to your actual .npy file locations
+    W_path = "/Users/raahimlone/New_Data/W.npy"
+    M_path = "/Users/raahimlone/New_Data/omega.npy"
+
+    print("[INFO] Loading W:", W_path)
+    W = np.load(W_path)
+
+    print("[INFO] Loading M:", M_path)
+    M = np.load(M_path)
+
+    # Force rank=6 solution
+    W_filled, U, svals, Vt = complete_matrix_rank_k(W, M, rank=6)
+
+    print("\n[RESULT] Completed matrix (sample):")
+    print(W_filled[:5, :5])
+
+    print("\n[RESULT] Singular values of the rank-6 solution:")
+    print(svals)  # Should see that at most 6 are non-negligible

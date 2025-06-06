@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
 """
-execute_queries.py
 A simplified script to execute SQL queries from a specified directory against a PostgreSQL database
 and measure their execution latency using EXPLAIN ANALYZE.
 """

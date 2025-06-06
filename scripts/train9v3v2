@@ -3,7 +3,7 @@
 Gauss-Newton based algorithm for inductive matrix completion with enhanced residual modeling.
 ### Enhanced with Weighted Residuals, Residual Tracking, Iterative Refinement, and LIME-QO ###
 ### Written by Pini Zilber and Boaz Nadler, 2022 ###
-### Updated by [Your Name], 2025 ###
+
 """
 
 import numpy as np
@@ -273,10 +273,10 @@ def train_residual_model(W_true, X_hat, A, B, M, scaler=None, poly=None, residua
     if residual_model is None:
         residual_model = xgb.XGBRegressor(
             objective='reg:squarederror',
-            n_estimators=2000,        # Number of boosting rounds
-            learning_rate=0.02,       # Learning rate
-            max_depth=10,             # Maximum tree depth
-            subsample=0.8,            # Subsample ratio of the training instances
+            n_estimators=4000,        # Number of boosting rounds
+            learning_rate=0.005,       # Learning rate
+            max_depth=20,             # Maximum tree depth
+            subsample=0.7,            # Subsample ratio of the training instances
             colsample_bytree=0.8,     # Subsample ratio of columns when constructing each tree
             verbosity=1,
             n_jobs=-1,                # Use all available cores
@@ -449,52 +449,57 @@ def LIMEQO(W_true, M, A, B, k, lambda_, t, m_select=3):
     return hint_selections, W_tilde, M, U_best, V_best, all_selected_hints
 
 if __name__ == "__main__":
+
+    data_dir = '/Users/raahimlone/New_Data'
+
     # Load W_true (Full Matrix)
     try:
-        W_true = np.load('/Users/raahimlone/New_Data/W_low_rank.npy')  # Shape: (n_queries, n_hints)
+        W_true = np.load(os.path.join(data_dir, 'Wnew.npy'))
         print("✅ W_true Loaded:")
         print(W_true)
         print(f"Shape of W_true: {W_true.shape}")
     except FileNotFoundError:
-        print("Error: W_low_rank.npy not found at the specified path.")
+        print(f"Error: Wnew.npy not found in {data_dir}.")
         exit(1)
 
     # Load Mask Matrix (M)
     try:
-        M = np.load('/Users/raahimlone/New_Data/M.npy')  # Shape: (n_queries, n_hints), with 1s and 0s
+        M = np.load(os.path.join(data_dir, 'Mnew.npy'))
         print("\n✅ Mask Matrix (M) Loaded:")
         print(M)
         print(f"Shape of M: {M.shape}")
     except FileNotFoundError:
-        print("Error: M.npy not found at the specified path.")
+        print(f"Error: Mnew.npy not found in {data_dir}.")
         exit(1)
 
-    # Load Side Information Matrices (A and B) from .npz Files
+    # Load Side Information Matrix A
     try:
-        data_X = np.load('/Users/raahimlone/New_Data/X_scaled.npz')  # Should contain 'A_scaled'
-        A = data_X['data']  # Adjust the key if different
-        print("\n✅ Side Information Matrix A Loaded from X_scaled.npz:")
+        data_X = np.load(os.path.join(data_dir, 'X_scalednew.npz'))
+        A = data_X['X']
+        print("\n✅ Side Information Matrix A Loaded from X_scalednew.npz:")
         print(A)
         print(f"Shape of A: {A.shape}")
     except FileNotFoundError:
-        print("Error: X_scaled.npz not found at the specified path.")
+        print(f"Error: X_scalednew.npz not found in {data_dir}.")
         exit(1)
     except KeyError:
-        print("Error: 'A_scaled' key not found in X_scaled.npz.")
+        print("Error: 'X' key not found in X_scalednew.npz.")
         exit(1)
 
+    # Load Side Information Matrix B
     try:
-        data_Y = np.load('/Users/raahimlone/New_Data/Y_scaled.npz')  # Should contain 'B_scaled'
-        B = data_Y['Y']  # Adjust the key if different
-        print("\n✅ Side Information Matrix B Loaded from Y_scaled.npz:")
+        data_Y = np.load(os.path.join(data_dir, 'Y_scalednew.npz'))
+        B = data_Y['Y']
+        print("\n✅ Side Information Matrix B Loaded from Y_scalednew.npz:")
         print(B)
         print(f"Shape of B: {B.shape}")
     except FileNotFoundError:
-        print("Error: Y_scaled.npz not found at the specified path.")
+        print(f"Error: Y_scalednew.npz not found in {data_dir}.")
         exit(1)
     except KeyError:
-        print("Error: 'B_scaled' key not found in Y_scaled.npz.")
+        print("Error: 'Y' key not found in Y_scalednew.npz.")
         exit(1)
+
 
     # Define Parameters
     rank = 5
@@ -570,8 +575,8 @@ if __name__ == "__main__":
     print(f"\nRelative Residual after Residual Model Adjustment: {relRes:.6e}")
 
     # Iterative Residual Correction Phase
-    target_relRes = 0.1  # Desired relative residual
-    max_iterations = 1  # Maximum number of residual correction iterations
+    target_relRes = 0.001  # Desired relative residual
+    max_iterations = 2  # Maximum number of residual correction iterations
     current_iteration = 0
 
     while relRes > target_relRes and current_iteration < max_iterations:

@@ -1,0 +1,7 @@
+INFO: Use pytorch device_name: mps
+INFO: Load pretrained SentenceTransformer: all-MiniLM-L6-v2
+INFO: 16c.sql               [default] arm=default  hints=(none                          )  lat=18675.86 ms   base=15680.55
+INFO: 16c.sql               [gnimc] arm=gnimc   hints=(hashjoin,mergejoin,seqscan    )  lat=17612.40 ms   base=15680.55
+INFO: 16c.sql               [full] arm=imc5    hints=(hashjoin,indexonlyscan,mergejoin,seqscan)  lat=31592.38 ms   base=15680.55
+INFO: 📊 wrote summary → results/summary.csv
+INFO: 🖼️  wrote plots → percentile_bar.png & waterfall.png

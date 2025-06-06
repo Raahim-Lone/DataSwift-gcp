@@ -1,0 +1,7 @@
+filename,cand_idx,combo,pred_cost,latency
+0c394ec452f81537eb30f24cfdf9bffcfb453a1d.sql,47,"nestloop,seqscan",-182.56561679783178,inf
+3f3a6dbc4eb63ebd0e65fc7b5c80859e3eef92ef.sql,47,"nestloop,seqscan",-197.5645304558422,inf
+7a160.sql,47,"nestloop,seqscan",-147.41408942159927,inf
+7e2ddef6e8f4f2771387a891c265b48eea23642f.sql,47,"nestloop,seqscan",-201.8161139620956,inf
+9713d7aeeec46c04f0f9afa2abf02d32f98e96ca.sql,47,"nestloop,seqscan",-209.44936927341476,inf
+e12b.sql,47,"nestloop,seqscan",-8.653828386700923,inf

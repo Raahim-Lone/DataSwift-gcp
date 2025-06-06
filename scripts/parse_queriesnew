@@ -1,0 +1,145 @@
+#!/usr/bin/env python3
+"""
+Script modified to parse SQL queries directly from a directory tree of JSON files
+(each JSON contains fields like: timestamp, filename, sql, plan, hint_list, runtime_list).
+Extracts features without scaling and saves feature matrices to Parquet, NPZ, and column list.
+Includes enhanced logging, support for files containing lists of records,
+and a CLI override for the JSON dataset directory.
+"""
+import os
+import sys
+import logging
+import argparse
+import json
+import pandas as pd
+import numpy as np
+
+# Configure environment
+def configure_environment():
+    """Dynamically set up sys.path to include the project root."""
+    project_root = os.path.abspath(
+        os.path.join(os.path.dirname(__file__), '..')
+    )
+    scripts_path = os.path.join(project_root, "scripts")
+    if scripts_path in sys.path:
+        sys.path.remove(scripts_path)
+    if project_root not in sys.path:
+        sys.path.insert(0, project_root)
+
+configure_environment()
+
+from src.utils.logger import setup_logger
+from src.utils.config_manager import load_config
+from src.data_io.sql_parser3 import parse_sql
+
+def main():
+    parser = argparse.ArgumentParser(
+        description=(
+            "Parse unique SQL queries from a directory of JSON files and extract features without scaling."
+        )
+    )
+    parser.add_argument(
+        "--config", type=str, default="config/default_config.yaml",
+        help="Path to configuration YAML file."
+    )
+    parser.add_argument(
+        "--dataset_dir", type=str,
+        help="Override the JSON dataset directory (e.g., /Users/raahimlone/Downloads/job)."
+    )
+    args = parser.parse_args()
+
+    config = load_config(args.config)
+
+    # Allow CLI override for dataset directory
+    json_dir = args.dataset_dir or config["database"].get(
+        "dataset_dir", config["database"].get("base_query_path")
+    )
+    processed_path = config["paths"]["processed_features"]
+
+    logger = setup_logger(
+        __name__,
+        config["logging"]["log_file"],
+        level=getattr(
+            logging, config["logging"]["log_level"].upper(), logging.INFO
+        ),
+        max_bytes=config["logging"].get("max_bytes", 10_485_760),
+        backup_count=config["logging"].get("backup_count", 5)
+    )
+
+    if not os.path.isdir(json_dir):
+        logger.error(f"JSON directory not found: {json_dir}")
+        sys.exit(1)
+
+    logger.info(f"Searching for JSON files under {json_dir}")
+
+    queries = []
+    total_files = 0
+    json_files = 0
+    for root, _, files in os.walk(json_dir):
+        for fname in files:
+            total_files += 1
+            if not fname.lower().endswith('.json'):
+                continue
+            json_files += 1
+            file_path = os.path.join(root, fname)
+            try:
+                with open(file_path, 'r', encoding='utf-8') as f:
+                    record = json.load(f)
+            except Exception as e:
+                logger.warning(f"Failed to load JSON: {file_path}: {e}")
+                continue
+            # Handle if record is list of objects
+            recs = record if isinstance(record, list) else [record]
+            for rec in recs:
+                sql = rec.get('sql')
+                if isinstance(sql, str) and sql.strip():
+                    queries.append(sql.strip())
+                else:
+                    logger.debug(f"Missing or empty 'sql' in record from file: {file_path}")
+
+    logger.info(f"Scanned {total_files} files, found {json_files} JSON files.")
+
+    if not queries:
+        logger.error("No SQL queries found in JSON directory.")
+        sys.exit(1)
+
+    # Deduplicate while preserving insertion order
+    unique_sqls = list(dict.fromkeys(queries))
+    logger.info(f"Found {len(unique_sqls)} unique SQL queries.")
+
+    all_features = []
+    for sql in unique_sqls:
+        try:
+            feats = parse_sql(sql)
+            if not feats:
+                raise ValueError("No features extracted")
+        except Exception as e:
+            logger.warning(f"Failed to parse SQL. Using default features. Error: {e}")
+            feats = {}
+        all_features.append(feats)
+
+    df_features = pd.DataFrame(all_features).fillna(0)
+    logger.info(
+        f"Extracted features for {df_features.shape[0]} queries with {df_features.shape[1]} columns."
+    )
+
+    os.makedirs(processed_path, exist_ok=True)
+    parquet_file = os.path.join(processed_path, "X_features.parquet")
+    df_features.to_parquet(parquet_file, index=False)
+    logger.info(f"Saved features to {parquet_file}")
+
+    npz_file = os.path.join(processed_path, "X_features.npz")
+    np.savez(npz_file, data=df_features.to_numpy())
+    logger.info(f"Saved features to {npz_file}")
+
+    cols_file = os.path.join(processed_path, "feature_columns.txt")
+    with open(cols_file, "w") as f:
+        for col in df_features.columns:
+            f.write(f"{col}\n")
+    logger.info(f"Saved feature column names to {cols_file}")
+
+    print("Head of extracted feature matrix:")
+    print(df_features.head())
+
+if __name__ == "__main__":
+    main()

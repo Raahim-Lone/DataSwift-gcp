@@ -15,7 +15,6 @@ def configure_environment():
     if project_root not in sys.path:
         sys.path.insert(0, project_root)
 
-# Call environment setup before importing anything from src
 configure_environment()
 
 import pandas as pd
